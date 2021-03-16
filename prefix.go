@@ -140,17 +140,7 @@ type Usage struct {
 }
 
 func (i *ipamer) NewPrefix(cidr string) (*Prefix, error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	existingPrefixes, err := i.storage.ReadAllPrefixCidrs()
-	if err != nil {
-		return nil, err
-	}
 	p, err := i.newPrefix(cidr, "")
-	if err != nil {
-		return nil, err
-	}
-	err = i.PrefixesOverlapping(existingPrefixes, []string{p.Cidr})
 	if err != nil {
 		return nil, err
 	}
@@ -260,6 +250,78 @@ func (i *ipamer) acquireChildPrefixInternal(parentCidr string, length uint8) (*P
 	return child, nil
 }
 
+func (i *ipamer) AcquireSpecificChildPrefix(parentCidr, childCidr string ) (*Prefix, error) {
+	var prefix *Prefix
+	return prefix, retryOnOptimisticLock(func() error {
+		var err error
+		prefix, err = i.acquireSpecificChildPrefixInternal(parentCidr, childCidr)
+		return err
+	})
+}
+
+// acquireChildPrefixInternal will return a Prefix with a smaller length from the given Prefix.
+func (i *ipamer) acquireSpecificChildPrefixInternal(parentCidr, childCidr string) (*Prefix, error) {
+	parent := i.PrefixFrom(parentCidr)
+	if parent == nil {
+		return nil, fmt.Errorf("unable to find prefix for cidr:%s", parentCidr)
+	}
+	ipprefix, err := netaddr.ParseIPPrefix(parent.Cidr)
+	if err != nil {
+		return nil, err
+	}
+	childprefix, err := netaddr.ParseIPPrefix(childCidr)
+	if err != nil {
+		return nil, err
+	}
+	if ipprefix.Bits >= childprefix.Bits {
+		return nil, fmt.Errorf("given length:%d must be greater than prefix length:%d", childprefix.Bits, ipprefix.Bits)
+	}
+	if parent.hasIPs() {
+		return nil, fmt.Errorf("prefix %s has ips, acquire child prefix not possible", parent.Cidr)
+	}
+
+	var ipset netaddr.IPSetBuilder
+	ipset.AddPrefix(ipprefix)
+	for cp, available := range parent.availableChildPrefixes {
+		if available {
+			continue
+		}
+		cpipprefix, err := netaddr.ParseIPPrefix(cp)
+		if err != nil {
+			return nil, err
+		}
+		ipset.RemovePrefix(cpipprefix)
+	}
+
+	ok := ipset.IPSet().ContainsPrefix(childprefix)
+	if !ok {
+		return nil, fmt.Errorf("the required subnet %s is not available to be reserved", childprefix.String())
+	}
+
+	child := &Prefix{
+		Cidr:       childprefix.String(),
+		ParentCidr: parentCidr,
+	}
+
+	parent.availableChildPrefixes[child.Cidr] = false
+	parent.isParent = true
+
+	_, err = i.storage.UpdatePrefix(*parent)
+	if err != nil {
+		return nil, fmt.Errorf("unable to update parent prefix:%v error:%w", parent, err)
+	}
+	child, err = i.newPrefix(child.Cidr, parentCidr)
+	if err != nil {
+		return nil, fmt.Errorf("unable to persist created child:%w", err)
+	}
+	_, err = i.storage.CreatePrefix(*child)
+	if err != nil {
+		return nil, fmt.Errorf("unable to update parent prefix:%v error:%w", child, err)
+	}
+
+	return child, nil
+}
+
 func (i *ipamer) ReleaseChildPrefix(child *Prefix) error {
 	return retryOnOptimisticLock(func() error {
 		return i.releaseChildPrefixInternal(child)
@@ -290,11 +352,7 @@ func (i *ipamer) releaseChildPrefixInternal(child *Prefix) error {
 }
 
 func (i *ipamer) PrefixFrom(cidr string) *Prefix {
-	ipprefix, err := netaddr.ParseIPPrefix(cidr)
-	if err != nil {
-		return nil
-	}
-	prefix, err := i.storage.ReadPrefix(ipprefix.Masked().String())
+	prefix, err := i.storage.ReadPrefix(cidr)
 	if err != nil {
 		return nil
 	}
@@ -338,7 +396,7 @@ func (i *ipamer) acquireSpecificIPInternal(prefixCidr, specificIP string) (*IP, 
 		}
 		_, ok := prefix.ips[specificIPnet.String()]
 		if ok {
-			return nil, fmt.Errorf("%w: given ip:%s is already allocated", ErrAlreadyAllocated, specificIPnet)
+			return nil, fmt.Errorf("%w: given ip:%s is already allocated", ErrAlreadyAllocated, specificIP)
 		}
 	}
 
@@ -411,7 +469,7 @@ func (i *ipamer) PrefixesOverlapping(existingPrefixes []string, newPrefixes []st
 				return fmt.Errorf("parsing prefix %s failed:%w", np, err)
 			}
 			if eip.Overlaps(nip) || nip.Overlaps(eip) {
-				return fmt.Errorf("%s overlaps %s", nip, eip)
+				return fmt.Errorf("%s overlaps %s", np, ep)
 			}
 		}
 	}
@@ -424,16 +482,8 @@ func (i *ipamer) newPrefix(cidr, parentCidr string) (*Prefix, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse cidr:%s %w", cidr, err)
 	}
-	if parentCidr != "" {
-		ipnetParent, err := netaddr.ParseIPPrefix(parentCidr)
-		if err != nil {
-			return nil, fmt.Errorf("unable to parse parent cidr:%s %w", cidr, err)
-		}
-		parentCidr = ipnetParent.Masked().String()
-	}
-
 	p := &Prefix{
-		Cidr:                   ipnet.Masked().String(),
+		Cidr:                   cidr,
 		ParentCidr:             parentCidr,
 		ips:                    make(map[string]bool),
 		availableChildPrefixes: make(map[string]bool),
